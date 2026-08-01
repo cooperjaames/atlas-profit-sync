@@ -35,9 +35,13 @@ const defaultMargin = parseFloat(PROFIT_MARGIN || '0.49');
 const API_VERSION = '2026-07';
 const STORE_TZ = 'America/Denver'; // Mountain Time — handles DST automatically
 
+function sleep(ms) {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
 // Retries transient failures (rate limits, network blips) instead of letting
 // one bad request silently drop a whole day's data.
-async function withRetry(fn, label, attempts = 3) {
+async function withRetry(fn, label, attempts = 5) {
   let lastErr;
   for (let i = 0; i < attempts; i++) {
     try {
@@ -45,9 +49,9 @@ async function withRetry(fn, label, attempts = 3) {
     } catch (err) {
       lastErr = err;
       if (i < attempts - 1) {
-        const delay = 500 * Math.pow(2, i); // 500ms, 1s, 2s
+        const delay = 1000 * Math.pow(2, i); // 1s, 2s, 4s, 8s
         console.error(`${label} failed (attempt ${i + 1}/${attempts}): ${err.message} — retrying in ${delay}ms`);
-        await new Promise((r) => setTimeout(r, delay));
+        await sleep(delay);
       }
     }
   }
@@ -134,6 +138,7 @@ async function fetchRevenue(store, token, start, end) {
     if (next) {
       const match = next.match(/<([^>]+)>/);
       url = match ? match[1] : null;
+      if (url) await sleep(600);
     } else {
       url = null;
     }
@@ -187,6 +192,7 @@ async function run() {
         const margin = store.margin !== undefined ? store.margin : defaultMargin;
         const share = store.share !== undefined ? store.share : 1;
         const revenue = await withRetry(() => fetchRevenue(store, token, start, end), `${store.name} ${dayKey}`);
+        await sleep(600); // stay under Shopify's rate limit across a long backfill run
         const contribution = Math.round(revenue * margin * share * 100) / 100;
         breakdown[store.name] = contribution;
         dayTotal += contribution;
