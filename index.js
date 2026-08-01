@@ -177,8 +177,12 @@ async function run() {
     }
 
     dayTotal = Math.round(dayTotal * 100) / 100;
-    await saveDay(dayKey, dayTotal, breakdown);
-    console.log(`${dayKey}: $${dayTotal.toFixed(2)} — ${JSON.stringify(breakdown)}`);
+    try {
+      await saveDay(dayKey, dayTotal, breakdown);
+      console.log(`${dayKey}: $${dayTotal.toFixed(2)} — ${JSON.stringify(breakdown)}`);
+    } catch (err) {
+      console.error(`[${dayKey}] Failed to save, skipping: ${err.message}`);
+    }
   }
 
   console.log('Done.');
