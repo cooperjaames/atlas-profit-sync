@@ -141,7 +141,7 @@ async function fetchRevenue(store, token, start, end) {
   return total;
 }
 
-async function saveDay(dayKey, amount, breakdown) {
+async function saveDay(dayKey, amount, breakdown, revenue) {
   const res = await fetch(`${SUPABASE_URL}/rest/v1/profit_entries?on_conflict=day`, {
     method: 'POST',
     headers: {
@@ -150,7 +150,7 @@ async function saveDay(dayKey, amount, breakdown) {
       'Content-Type': 'application/json',
       Prefer: 'resolution=merge-duplicates',
     },
-    body: JSON.stringify({ day: dayKey, amount, breakdown }),
+    body: JSON.stringify({ day: dayKey, amount, breakdown, revenue }),
   });
   if (!res.ok) {
     throw new Error(`Supabase write failed for ${dayKey}: ${res.status} ${await res.text()}`);
@@ -178,6 +178,7 @@ async function run() {
     const { start, end } = dayBoundsFor(dayKey);
     const breakdown = {};
     let dayTotal = 0;
+    let dayRevenue = 0;
 
     for (const store of stores) {
       const token = tokens[store.name];
@@ -189,6 +190,7 @@ async function run() {
         const contribution = Math.round(revenue * margin * share * 100) / 100;
         breakdown[store.name] = contribution;
         dayTotal += contribution;
+        dayRevenue += revenue;
       } catch (err) {
         console.error(`[${dayKey}] Skipping ${store.name}: ${err.message}`);
         breakdown[store.name] = 0;
@@ -196,9 +198,10 @@ async function run() {
     }
 
     dayTotal = Math.round(dayTotal * 100) / 100;
+    dayRevenue = Math.round(dayRevenue * 100) / 100;
     try {
-      await withRetry(() => saveDay(dayKey, dayTotal, breakdown), `Save ${dayKey}`);
-      console.log(`${dayKey}: $${dayTotal.toFixed(2)} — ${JSON.stringify(breakdown)}`);
+      await withRetry(() => saveDay(dayKey, dayTotal, breakdown, dayRevenue), `Save ${dayKey}`);
+      console.log(`${dayKey}: $${dayTotal.toFixed(2)} (revenue $${dayRevenue.toFixed(2)}) — ${JSON.stringify(breakdown)}`);
     } catch (err) {
       console.error(`[${dayKey}] Failed to save after retries, skipping: ${err.message}`);
     }
