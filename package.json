@@ -1,0 +1,12 @@
+{
+  "name": "atlas-profit-sync",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "Pulls today's Shopify orders, estimates profit at a set margin, and logs it to Supabase for the ATLAS dashboard.",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
