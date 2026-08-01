@@ -1,11 +1,18 @@
 // ATLAS profit sync
-// Pulls today's revenue from every connected store, applies each store's
-// profit margin and Cooper's ownership share, and upserts the combined
-// total into Supabase's profit_entries table.
+// Pulls revenue per store, applies each store's margin and Cooper's
+// ownership share, and upserts both the combined total AND a per-store
+// breakdown into Supabase's profit_entries table.
+//
+// Normal mode: processes only "today".
+// Backfill mode: set BACKFILL_FROM="YYYY-MM-DD" to reprocess every day
+// from that date through today. Unset it again afterward — leaving it set
+// means every scheduled run reprocesses the whole range, which is slow
+// and hammers the Shopify API for no reason.
+//
 // All credentials come from environment variables — never hardcode them here,
 // this repo is public.
 
-const { STORES_CONFIG, SUPABASE_URL, SUPABASE_SERVICE_KEY, PROFIT_MARGIN } = process.env;
+const { STORES_CONFIG, SUPABASE_URL, SUPABASE_SERVICE_KEY, PROFIT_MARGIN, BACKFILL_FROM } = process.env;
 
 if (!STORES_CONFIG) {
   console.error('Missing required environment variable: STORES_CONFIG');
@@ -28,8 +35,7 @@ const defaultMargin = parseFloat(PROFIT_MARGIN || '0.49');
 const API_VERSION = '2026-07';
 const STORE_TZ = 'America/Denver'; // Mountain Time — handles DST automatically
 
-// The server this runs on keeps UTC time, not Mountain Time, so "today"
-// has to be computed against STORE_TZ explicitly or the day boundary drifts.
+// ---------- Mountain-Time-aware date helpers ----------
 function getOffsetMinutes(date, timeZone) {
   const dtf = new Intl.DateTimeFormat('en-US', {
     timeZone, hour12: false,
@@ -43,20 +49,33 @@ function getOffsetMinutes(date, timeZone) {
   return (asUTC - date.getTime()) / 60000;
 }
 
-function todayBounds() {
-  const now = new Date();
-  const dayKey = new Intl.DateTimeFormat('en-CA', { timeZone: STORE_TZ }).format(now); // "YYYY-MM-DD" in Mountain Time
+// Midnight-to-midnight (Mountain Time) bounds for a given calendar day, as UTC ISO strings.
+function dayBoundsFor(dayKey) {
   const [y, m, d] = dayKey.split('-').map(Number);
-  const guessUTC = Date.UTC(y, m - 1, d, 0, 0, 0);
-  const offsetMin = getOffsetMinutes(now, STORE_TZ);
-  const startMs = guessUTC - offsetMin * 60000; // midnight Mountain Time, expressed in UTC
-  return {
-    start: new Date(startMs).toISOString(),
-    end: now.toISOString(),
-    dayKey,
-  };
+  const refInstant = new Date(Date.UTC(y, m - 1, d, 18)); // midday UTC on that date, safely inside the day for offset lookup
+  const offsetMin = getOffsetMinutes(refInstant, STORE_TZ);
+  const startUTC = Date.UTC(y, m - 1, d, 0, 0, 0) - offsetMin * 60000;
+  const endUTC = startUTC + 24 * 60 * 60 * 1000;
+  return { start: new Date(startUTC).toISOString(), end: new Date(endUTC).toISOString() };
 }
 
+function todayKey() {
+  return new Intl.DateTimeFormat('en-CA', { timeZone: STORE_TZ }).format(new Date()); // "YYYY-MM-DD"
+}
+
+function dateRange(fromKey, toKey) {
+  const keys = [];
+  let [y, m, d] = fromKey.split('-').map(Number);
+  const cursor = new Date(Date.UTC(y, m - 1, d));
+  const endCursor = (() => { const [ey, em, ed] = toKey.split('-').map(Number); return new Date(Date.UTC(ey, em - 1, ed)); })();
+  while (cursor.getTime() <= endCursor.getTime()) {
+    keys.push(cursor.toISOString().slice(0, 10));
+    cursor.setUTCDate(cursor.getUTCDate() + 1);
+  }
+  return keys;
+}
+
+// ---------- Shopify ----------
 async function getAccessToken(store) {
   const res = await fetch(`https://${store.domain}/admin/oauth/access_token`, {
     method: 'POST',
@@ -74,24 +93,36 @@ async function getAccessToken(store) {
   return data.access_token;
 }
 
-async function fetchTodaysRevenue(store, token) {
-  const { start, end } = todayBounds();
-  const url =
+// Fetches all orders (paginated) within [start, end) and returns total revenue.
+async function fetchRevenue(store, token, start, end) {
+  let total = 0;
+  let url =
     `https://${store.domain}/admin/api/${API_VERSION}/orders.json` +
     `?status=any&created_at_min=${encodeURIComponent(start)}&created_at_max=${encodeURIComponent(end)}&limit=250`;
 
-  const res = await fetch(url, {
-    headers: { 'X-Shopify-Access-Token': token },
-  });
-  if (!res.ok) {
-    throw new Error(`[${store.name}] orders request failed: ${res.status} ${await res.text()}`);
+  while (url) {
+    const res = await fetch(url, { headers: { 'X-Shopify-Access-Token': token } });
+    if (!res.ok) {
+      throw new Error(`[${store.name}] orders request failed: ${res.status} ${await res.text()}`);
+    }
+    const data = await res.json();
+    const orders = data.orders || [];
+    total += orders.reduce((sum, o) => sum + parseFloat(o.total_price || '0'), 0);
+
+    // Cursor-based pagination via the Link header, for months with >250 orders.
+    const link = res.headers.get('link') || res.headers.get('Link');
+    const next = link && link.split(',').find((p) => p.includes('rel="next"'));
+    if (next) {
+      const match = next.match(/<([^>]+)>/);
+      url = match ? match[1] : null;
+    } else {
+      url = null;
+    }
   }
-  const data = await res.json();
-  const orders = data.orders || [];
-  return orders.reduce((sum, o) => sum + parseFloat(o.total_price || '0'), 0);
+  return total;
 }
 
-async function saveProfit(dayKey, amount) {
+async function saveDay(dayKey, amount, breakdown) {
   const res = await fetch(`${SUPABASE_URL}/rest/v1/profit_entries?on_conflict=day`, {
     method: 'POST',
     headers: {
@@ -100,39 +131,57 @@ async function saveProfit(dayKey, amount) {
       'Content-Type': 'application/json',
       Prefer: 'resolution=merge-duplicates',
     },
-    body: JSON.stringify({ day: dayKey, amount }),
+    body: JSON.stringify({ day: dayKey, amount, breakdown }),
   });
   if (!res.ok) {
-    throw new Error(`Supabase write failed: ${res.status} ${await res.text()}`);
+    throw new Error(`Supabase write failed for ${dayKey}: ${res.status} ${await res.text()}`);
   }
 }
 
 async function run() {
-  const { dayKey } = todayBounds();
-  console.log(`Syncing profit for ${dayKey} across ${stores.length} store(s)...`);
+  const fromKey = BACKFILL_FROM || todayKey();
+  const toKey = todayKey();
+  const days = dateRange(fromKey, toKey);
+  const mode = BACKFILL_FROM ? `BACKFILL (${fromKey} -> ${toKey}, ${days.length} day(s))` : 'daily sync (today only)';
+  console.log(`Running in ${mode} across ${stores.length} store(s)...`);
 
-  let totalProfit = 0;
-  const breakdown = [];
-
+  // Get one token per store up front, reused for every day in range.
+  const tokens = {};
   for (const store of stores) {
     try {
-      const margin = store.margin !== undefined ? store.margin : defaultMargin;
-      const share = store.share !== undefined ? store.share : 1;
-      const token = await getAccessToken(store);
-      const revenue = await fetchTodaysRevenue(store, token);
-      const contribution = revenue * margin * share;
-      totalProfit += contribution;
-      breakdown.push(`${store.name}: revenue $${revenue.toFixed(2)} × ${(margin * 100).toFixed(0)}% margin × ${(share * 100).toFixed(0)}% share = $${contribution.toFixed(2)}`);
+      tokens[store.name] = await getAccessToken(store);
     } catch (err) {
-      console.error(`Skipping ${store.name} due to error: ${err.message}`);
+      console.error(`Could not authenticate ${store.name}: ${err.message}`);
     }
   }
 
-  totalProfit = Math.round(totalProfit * 100) / 100;
-  await saveProfit(dayKey, totalProfit);
+  for (const dayKey of days) {
+    const { start, end } = dayBoundsFor(dayKey);
+    const breakdown = {};
+    let dayTotal = 0;
 
-  console.log(breakdown.join('\n'));
-  console.log(`Done. Logged combined profit $${totalProfit.toFixed(2)} for ${dayKey}.`);
+    for (const store of stores) {
+      const token = tokens[store.name];
+      if (!token) { breakdown[store.name] = 0; continue; }
+      try {
+        const margin = store.margin !== undefined ? store.margin : defaultMargin;
+        const share = store.share !== undefined ? store.share : 1;
+        const revenue = await fetchRevenue(store, token, start, end);
+        const contribution = Math.round(revenue * margin * share * 100) / 100;
+        breakdown[store.name] = contribution;
+        dayTotal += contribution;
+      } catch (err) {
+        console.error(`[${dayKey}] Skipping ${store.name}: ${err.message}`);
+        breakdown[store.name] = 0;
+      }
+    }
+
+    dayTotal = Math.round(dayTotal * 100) / 100;
+    await saveDay(dayKey, dayTotal, breakdown);
+    console.log(`${dayKey}: $${dayTotal.toFixed(2)} — ${JSON.stringify(breakdown)}`);
+  }
+
+  console.log('Done.');
 }
 
 run().catch((err) => {
