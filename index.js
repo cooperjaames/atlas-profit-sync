@@ -35,6 +35,25 @@ const defaultMargin = parseFloat(PROFIT_MARGIN || '0.49');
 const API_VERSION = '2026-07';
 const STORE_TZ = 'America/Denver'; // Mountain Time — handles DST automatically
 
+// Retries transient failures (rate limits, network blips) instead of letting
+// one bad request silently drop a whole day's data.
+async function withRetry(fn, label, attempts = 3) {
+  let lastErr;
+  for (let i = 0; i < attempts; i++) {
+    try {
+      return await fn();
+    } catch (err) {
+      lastErr = err;
+      if (i < attempts - 1) {
+        const delay = 500 * Math.pow(2, i); // 500ms, 1s, 2s
+        console.error(`${label} failed (attempt ${i + 1}/${attempts}): ${err.message} — retrying in ${delay}ms`);
+        await new Promise((r) => setTimeout(r, delay));
+      }
+    }
+  }
+  throw lastErr;
+}
+
 // ---------- Mountain-Time-aware date helpers ----------
 function getOffsetMinutes(date, timeZone) {
   const dtf = new Intl.DateTimeFormat('en-US', {
@@ -149,7 +168,7 @@ async function run() {
   const tokens = {};
   for (const store of stores) {
     try {
-      tokens[store.name] = await getAccessToken(store);
+      tokens[store.name] = await withRetry(() => getAccessToken(store), `Auth ${store.name}`);
     } catch (err) {
       console.error(`Could not authenticate ${store.name}: ${err.message}`);
     }
@@ -166,7 +185,7 @@ async function run() {
       try {
         const margin = store.margin !== undefined ? store.margin : defaultMargin;
         const share = store.share !== undefined ? store.share : 1;
-        const revenue = await fetchRevenue(store, token, start, end);
+        const revenue = await withRetry(() => fetchRevenue(store, token, start, end), `${store.name} ${dayKey}`);
         const contribution = Math.round(revenue * margin * share * 100) / 100;
         breakdown[store.name] = contribution;
         dayTotal += contribution;
@@ -178,10 +197,10 @@ async function run() {
 
     dayTotal = Math.round(dayTotal * 100) / 100;
     try {
-      await saveDay(dayKey, dayTotal, breakdown);
+      await withRetry(() => saveDay(dayKey, dayTotal, breakdown), `Save ${dayKey}`);
       console.log(`${dayKey}: $${dayTotal.toFixed(2)} — ${JSON.stringify(breakdown)}`);
     } catch (err) {
-      console.error(`[${dayKey}] Failed to save, skipping: ${err.message}`);
+      console.error(`[${dayKey}] Failed to save after retries, skipping: ${err.message}`);
     }
   }
 
