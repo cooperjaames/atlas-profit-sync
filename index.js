@@ -29,14 +29,34 @@ for (const [key, val] of Object.entries(REQUIRED)) {
 
 const margin = parseFloat(PROFIT_MARGIN || '0.49');
 const API_VERSION = '2026-07';
+const STORE_TZ = 'America/Denver'; // Mountain Time — handles DST automatically
+
+// The server this runs on keeps UTC time, not Mountain Time, so "today"
+// has to be computed against STORE_TZ explicitly or the day boundary drifts.
+function getOffsetMinutes(date, timeZone) {
+  const dtf = new Intl.DateTimeFormat('en-US', {
+    timeZone, hour12: false,
+    year: 'numeric', month: '2-digit', day: '2-digit',
+    hour: '2-digit', minute: '2-digit', second: '2-digit',
+  });
+  const parts = {};
+  dtf.formatToParts(date).forEach((p) => { if (p.type !== 'literal') parts[p.type] = p.value; });
+  const hour = parts.hour === '24' ? '0' : parts.hour;
+  const asUTC = Date.UTC(parts.year, parts.month - 1, parts.day, hour, parts.minute, parts.second);
+  return (asUTC - date.getTime()) / 60000;
+}
 
 function todayBounds() {
   const now = new Date();
-  const start = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+  const dayKey = new Intl.DateTimeFormat('en-CA', { timeZone: STORE_TZ }).format(now); // "YYYY-MM-DD" in Mountain Time
+  const [y, m, d] = dayKey.split('-').map(Number);
+  const guessUTC = Date.UTC(y, m - 1, d, 0, 0, 0);
+  const offsetMin = getOffsetMinutes(now, STORE_TZ);
+  const startMs = guessUTC - offsetMin * 60000; // midnight Mountain Time, expressed in UTC
   return {
-    start: start.toISOString(),
+    start: new Date(startMs).toISOString(),
     end: now.toISOString(),
-    dayKey: start.toISOString().slice(0, 10),
+    dayKey,
   };
 }
 
