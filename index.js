@@ -1,33 +1,30 @@
 // ATLAS profit sync
-// Pulls today's Shopify orders, estimates profit using a fixed margin,
-// and upserts it into Supabase's profit_entries table.
+// Pulls today's revenue from every connected store, applies each store's
+// profit margin and Cooper's ownership share, and upserts the combined
+// total into Supabase's profit_entries table.
 // All credentials come from environment variables — never hardcode them here,
 // this repo is public.
 
-const {
-  SHOPIFY_CLIENT_ID,
-  SHOPIFY_CLIENT_SECRET,
-  SHOPIFY_SHOP_DOMAIN,
-  SUPABASE_URL,
-  SUPABASE_SERVICE_KEY,
-  PROFIT_MARGIN,
-} = process.env;
+const { STORES_CONFIG, SUPABASE_URL, SUPABASE_SERVICE_KEY, PROFIT_MARGIN } = process.env;
 
-const REQUIRED = {
-  SHOPIFY_CLIENT_ID,
-  SHOPIFY_CLIENT_SECRET,
-  SHOPIFY_SHOP_DOMAIN,
-  SUPABASE_URL,
-  SUPABASE_SERVICE_KEY,
-};
-for (const [key, val] of Object.entries(REQUIRED)) {
-  if (!val) {
-    console.error(`Missing required environment variable: ${key}`);
-    process.exit(1);
-  }
+if (!STORES_CONFIG) {
+  console.error('Missing required environment variable: STORES_CONFIG');
+  process.exit(1);
+}
+if (!SUPABASE_URL || !SUPABASE_SERVICE_KEY) {
+  console.error('Missing required Supabase environment variables.');
+  process.exit(1);
 }
 
-const margin = parseFloat(PROFIT_MARGIN || '0.49');
+let stores;
+try {
+  stores = JSON.parse(STORES_CONFIG);
+} catch (e) {
+  console.error('STORES_CONFIG is not valid JSON:', e.message);
+  process.exit(1);
+}
+
+const defaultMargin = parseFloat(PROFIT_MARGIN || '0.49');
 const API_VERSION = '2026-07';
 const STORE_TZ = 'America/Denver'; // Mountain Time — handles DST automatically
 
@@ -60,34 +57,34 @@ function todayBounds() {
   };
 }
 
-async function getAccessToken() {
-  const res = await fetch(`https://${SHOPIFY_SHOP_DOMAIN}/admin/oauth/access_token`, {
+async function getAccessToken(store) {
+  const res = await fetch(`https://${store.domain}/admin/oauth/access_token`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
-      client_id: SHOPIFY_CLIENT_ID,
-      client_secret: SHOPIFY_CLIENT_SECRET,
+      client_id: store.clientId,
+      client_secret: store.secret,
       grant_type: 'client_credentials',
     }),
   });
   if (!res.ok) {
-    throw new Error(`Shopify token request failed: ${res.status} ${await res.text()}`);
+    throw new Error(`[${store.name}] token request failed: ${res.status} ${await res.text()}`);
   }
   const data = await res.json();
   return data.access_token;
 }
 
-async function fetchTodaysRevenue(token) {
+async function fetchTodaysRevenue(store, token) {
   const { start, end } = todayBounds();
   const url =
-    `https://${SHOPIFY_SHOP_DOMAIN}/admin/api/${API_VERSION}/orders.json` +
+    `https://${store.domain}/admin/api/${API_VERSION}/orders.json` +
     `?status=any&created_at_min=${encodeURIComponent(start)}&created_at_max=${encodeURIComponent(end)}&limit=250`;
 
   const res = await fetch(url, {
     headers: { 'X-Shopify-Access-Token': token },
   });
   if (!res.ok) {
-    throw new Error(`Shopify orders request failed: ${res.status} ${await res.text()}`);
+    throw new Error(`[${store.name}] orders request failed: ${res.status} ${await res.text()}`);
   }
   const data = await res.json();
   const orders = data.orders || [];
@@ -112,17 +109,30 @@ async function saveProfit(dayKey, amount) {
 
 async function run() {
   const { dayKey } = todayBounds();
-  console.log(`Syncing profit for ${dayKey}...`);
+  console.log(`Syncing profit for ${dayKey} across ${stores.length} store(s)...`);
 
-  const token = await getAccessToken();
-  const revenue = await fetchTodaysRevenue(token);
-  const estimatedProfit = Math.round(revenue * margin * 100) / 100;
+  let totalProfit = 0;
+  const breakdown = [];
 
-  await saveProfit(dayKey, estimatedProfit);
-  console.log(
-    `Done. Revenue: $${revenue.toFixed(2)} × ${(margin * 100).toFixed(0)}% margin ` +
-    `-> logged $${estimatedProfit.toFixed(2)} for ${dayKey}.`
-  );
+  for (const store of stores) {
+    try {
+      const margin = store.margin !== undefined ? store.margin : defaultMargin;
+      const share = store.share !== undefined ? store.share : 1;
+      const token = await getAccessToken(store);
+      const revenue = await fetchTodaysRevenue(store, token);
+      const contribution = revenue * margin * share;
+      totalProfit += contribution;
+      breakdown.push(`${store.name}: revenue $${revenue.toFixed(2)} × ${(margin * 100).toFixed(0)}% margin × ${(share * 100).toFixed(0)}% share = $${contribution.toFixed(2)}`);
+    } catch (err) {
+      console.error(`Skipping ${store.name} due to error: ${err.message}`);
+    }
+  }
+
+  totalProfit = Math.round(totalProfit * 100) / 100;
+  await saveProfit(dayKey, totalProfit);
+
+  console.log(breakdown.join('\n'));
+  console.log(`Done. Logged combined profit $${totalProfit.toFixed(2)} for ${dayKey}.`);
 }
 
 run().catch((err) => {
